@@ -108,6 +108,30 @@ Pick a string that appears **only** in a TRUE (row-returning) response and never
 
 ---
 
+## Required flags
+
+Every run needs these:
+
+| Flag | Required? | Purpose |
+|---|---|---|
+| `-r, --request FILE` | **yes** | raw HTTP request containing one `*` injection marker |
+| `--true-string STR` | **yes** (or `--false-string`) | the oracle — a string seen only in TRUE responses |
+| `--prefix STR` | **strongly recommended** | breakout before your condition (e.g. `"' AND "`) |
+| `--suffix STR` | recommended | comment terminator (default `"-- -"`) |
+| `--force-ssl` | if HTTPS | force https on the request |
+
+Then add **at least one action** (what to extract): `--current-user`, `--current-db`,
+`--banner`, `--is-dba`, `--dbs`, `--tables`, `--columns`, `--dump`,
+`--guess-dbs`, `--guess-tables`, or `--guess-columns`.
+
+Minimal working invocation:
+
+```bash
+./pinhole -r req.txt --true-string "TOKEN" --prefix "value' AND " --current-db
+```
+
+---
+
 ## Workflow
 
 PINHOLE follows the same stages as sqlmap:
