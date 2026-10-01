@@ -77,6 +77,9 @@ class RawRequest:
     def __init__(self, path, force_ssl=False):
         with open(path, "r", errors="replace") as f:
             raw = f.read()
+        # drop leading blank lines so the head/body split can't swallow the
+        # request line + Host header (otherwise base_url has no host)
+        raw = re.sub(r"^(?:[ \t]*\r?\n)+", "", raw)
         if MARKER not in raw:
             sys.exit(f"No injection marker '{MARKER}' found in request file.")
         parts = re.split(r"\r?\n\r?\n", raw, maxsplit=1)
@@ -175,14 +178,21 @@ class Injector:
             info(f"pinned backend affinity")
 
     # ---- oracle ------------------------------------------------------
+    @staticmethod
+    def _norm(s):
+        # collapse CRLF/CR to LF so a pasted multi-line token matches a
+        # response that uses different line endings (classic \n vs \r\n bite)
+        return s.replace("\r\n", "\n").replace("\r", "\n")
+
     def _read(self, resp):
         if resp.status_code == 500:
             return None
+        text = self._norm(resp.text)
         if self.args.true_string:
-            return self.args.true_string in resp.text
+            return self._norm(self.args.true_string) in text
         if self.args.false_string:
-            return self.args.false_string not in resp.text
-        return resp.status_code == 200 and resp.text.strip() != self.args.false_default
+            return self._norm(self.args.false_string) not in text
+        return resp.status_code == 200 and text.strip() != self.args.false_default
 
     def _over_budget(self, condition):
         if not self.max_payload:
